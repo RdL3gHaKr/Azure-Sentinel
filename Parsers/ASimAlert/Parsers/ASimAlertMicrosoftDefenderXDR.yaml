@@ -1,0 +1,185 @@
+Parser:
+  Title: Alert ASIM parser for Microsoft Defender XDR
+  Version: '0.1.0'
+  LastUpdated: Oct 09, 2024
+Product:
+  Name: Microsoft Defender XDR
+Normalization:
+  Schema: Alert
+  Version: '0.1'
+References:
+- Title: ASIM Alert Schema
+  Link: https://aka.ms/ASimAlertDoc
+- Title: ASIM
+  Link: https://aka.ms/AboutASIM
+Description: |
+  This ASIM parser supports normalizing the Microsoft Defender XDR logs to the ASIM Alert normalized schema.
+ParserName: ASimAlertMicrosoftDefenderXDR
+EquivalentBuiltInParser: _ASim_Alert_MicrosoftDefenderXDR
+ParserParams:
+  - Name: disabled
+    Type: bool
+    Default: false
+ParserQuery: |
+    let IndicatorTypeLookup = datatable (EntityType: string, IndicatorType: string)
+    [
+    "User", "User",
+    "Machine", "Host",
+    "Process", "Process",
+    "File", "File",
+    "Ip", "Ip",
+    "Url", "Url",
+    "RegistryValue", "Registry",
+    "CloudLogonSession", "LogonSession",
+    "CloudApplication", "Application",
+    "Mailbox", "Mailbox",
+    "MailMessage", "Email",
+    "CloudResource", "Cloud Resource"
+    ];
+    let AlertSourceAnalyticDetailsLookup = datatable (
+        DetectionSource: string,
+        AlertSourceAnalyticDetails: string
+    )
+        [
+        "EDR", "EDR",
+        "Antivirus", "Antivirus",
+        "Microsoft Data Loss Prevention", "DataLossPrevention",
+        "Scheduled Alerts", "ScheduledAlerts",
+        "Cloud App Security", "CloudApplicationSecurity"
+    ];
+    let IndicatorAssociationLookup = datatable (EvidenceRole: string, IndicatorAssociation: string)
+        [
+        "Related", "Associated",
+        "Impacted", "Targeted"
+    ];
+    let RegistryValueTypeLookup = datatable (ValueType: string, RegistryValueType: string)
+        [
+        "ExpandString", "Reg_Expand_Sz"
+    ];
+    let AlertVerdictLookup = datatable (AlertVerdict_Custom: string, AlertVerdict: string)
+        [
+        "Malicious", "True Positive",
+        "Suspicious", "True Positive",
+        "NoThreatsFound", "Benign Positive"
+    ];
+    let AttackTacticSet = dynamic(["Exfiltration", "PrivilegeEscalation", "Persistence", "LateralMovement", "Execution", "Discovery", "InitialAccess", "CredentialAccess", "DefenseEvasion", "CommandAndControl", "Impact"]);
+    let ThreatCategorySet = dynamic(["Malware", "Ransomware", "Trojan", "Virus", "Worm", "Adware", "Spyware", "Rootkit", "Cryptominor", "Phishing", "Spam", "MaliciousUrl", "Spoofing", "Security Policy Violation", "Unknown", "SuspiciousActivity"]);
+    let parser = (
+        disabled: bool=false) {
+        AlertEvidence
+        | where not(disabled)
+        // Mapping Alert Fields
+        | extend 
+            AlertId = AlertId,
+            AlertName = Title,
+            AlertSource = ServiceSource,
+            AlertVerdict_Custom = tostring(AdditionalFields.ThreatAnalysisSummary[0].Verdict),
+            AlertVerdictDate = todatetime(AdditionalFields.ThreatAnalysisSummary[0].AnalysisDate),
+            AttackTactics = iff(Categories has_any (AttackTacticSet), replace(@"[\[\]\""]", "", Categories), ""),
+            AlertOriginalStatus = tostring(AdditionalFields.LastRemediationState),
+            AlertStatus = iif(isnotempty(AdditionalFields.LastRemediationState), iif(AdditionalFields.LastRemediationState == "Active", "Active", "Closed"), "")
+        | lookup AlertVerdictLookup on AlertVerdict_Custom
+        | lookup IndicatorTypeLookup on EntityType
+        | lookup IndicatorAssociationLookup on EvidenceRole
+        | lookup AlertSourceAnalyticDetailsLookup on DetectionSource
+        // Mapping Threat Fields
+        | extend
+            ThreatCategory = iif(Categories has_any (ThreatCategorySet), replace(@"[\[\]\""]", "", Categories), ""),
+            ThreatIsActive = iif(isnotempty(AdditionalFields.LastRemediationState), iif(tostring(AdditionalFields.LastRemediationState) == "Active", True, False), bool(null))
+        // Mapping User Entity
+        | extend 
+            UserId = coalesce(AccountObjectId, tostring(AdditionalFields.Account.AadUserId)),
+            UserSid = coalesce(AccountSid, tostring(AdditionalFields.Account.Sid)),
+            Username = coalesce(AccountUpn, tostring(AdditionalFields.Account.UserPrincipalName)),
+            SessionId = tostring(AdditionalFields.SessionId),
+            UserScopeId = tostring(AdditionalFields.AadTenantId)
+        // Mapping Device Entity
+        | extend 
+            DvcId = coalesce(DeviceId, tostring(AdditionalFields.Host.MachineId)),
+            DvcIpAddr = coalesce(LocalIP, tostring(AdditionalFields.Host.IpInterfaces[0].Address), RemoteIP),
+            DvcOs = tostring(coalesce(AdditionalFields.OSFamily, AdditionalFields.Host.OSFamily)),
+            DvcOsVersion = tostring(coalesce(AdditionalFields.OSVersion, AdditionalFields.Host.OSVersion)),
+            DeviceName = coalesce(DeviceName, tostring(AdditionalFields.Host.NetBiosName)),
+            DvcScopeId = coalesce(tostring(split(AdditionalFields.AzureID, "/")[2]), (tostring(split(AdditionalFields.ResourceId, "/")[2])))
+        | invoke _ASIM_ResolveDvcFQDN("DeviceName")
+        | extend Hostname = DvcHostname
+        // Mapping IP Entity
+        | extend 
+            IpAddr = RemoteIP,
+            GeoCity = AdditionalFields.Location.City,
+            GeoCountry = AdditionalFields.Location.CountryCode,
+            GeoLatitude = AdditionalFields.Location.Latitude,
+            GeoLongitude = AdditionalFields.Location.Longitude,
+            GeoRegion = AdditionalFields.Location.State
+        // Mapping Process Entity
+        | extend 
+            ProcessId = AdditionalFields.ProcessId,
+            ProcessCommandLine,
+            ProcessName = iif(IndicatorType == "Process", iif(isnotempty(FolderPath) and isnotempty(FileName), strcat(FolderPath, '\\', FileName), FileName), ""),
+            ProcessFileCompany = AdditionalFields.Publisher,
+            // Parent Process Fields
+            ParentProcessId = AdditionalFields.ParentProcess.ProcessId,
+            ParentProcessCommandLine = AdditionalFields.ParentProcess.CommandLine,
+            //ParentProcessName = strcat (AdditionalFields.ParentProcess.ImageFile.Directory, "\\", AdditionalFields.ParentProcess.ImageFile.Name),
+            ParentProcessName = iif(IndicatorType == "Process", iif(isnotempty(AdditionalFields.ParentProcess.ImageFile.Directory) and isnotempty(AdditionalFields.ParentProcess.ImageFile.Name), strcat (AdditionalFields.ParentProcess.ImageFile.Directory, "\\", AdditionalFields.ParentProcess.ImageFile.Name), coalesce(AdditionalFields.ParentProcess.ImageFile.Name, AdditionalFields.ParentProcess.FriendlyName)), ""),
+            ParentProcessSHA1 = AdditionalFields.ParentProcess.ImageFile[0].SHA1,
+            ParentProcessSHA256 = AdditionalFields.ParentProcess.ImageFile[2].SHA256,
+            ParentProcessMD5 = AdditionalFields.ParentProcess.ImageFile[1].MD5
+        // Mapping File Entity
+        | extend 
+            FileName,
+            FileDirectory = FolderPath,
+            FilePath = iff(isnotempty(FolderPath) and isnotempty(FileName), strcat(FolderPath, '\\', FileName), FileName),
+            FileSHA1 = SHA1,
+            FileSHA256 = SHA256,
+            FileMD5 = AdditionalFields.FileHashes[1].Value,
+            FileSize = FileSize
+        // Mapping Url Entity
+        | extend 
+            Url = RemoteUrl
+        // Mapping Registry Entity
+        | extend 
+            RegistryKey,
+            RegistryValue = RegistryValueName,
+            RegistryValueData,
+            ValueType = tostring(AdditionalFields.ValueType)
+        | lookup RegistryValueTypeLookup on ValueType
+        // Mapping Application Entity
+        | extend 
+            HttpUserAgent = AdditionalFields.UserAgent,
+            AppId = ApplicationId,
+            AppName = Application
+        // Mapping Email Entity
+        | extend 
+            EmailMessageId = NetworkMessageId,
+            EmailSubject
+        // Mapping common event fields
+        | extend
+            EventSubType = "Threat", // All events in AlertEvidence contains threat info
+            EventEndTime = TimeGenerated,
+            EventStartTime = TimeGenerated,
+            EventProduct = 'Defender XDR',
+            EventVendor = 'Microsoft',
+            EventSchemaVersion = '0.1',
+            EventType = 'Alert',
+            EventUid = _ItemId
+        | project-away
+            Title,
+            Categories,
+            EntityType,
+            EvidenceRole,
+            DetectionSource,
+            ServiceSource,
+            ThreatFamily,
+            RemoteIP,
+            RemoteUrl,
+            AccountName,
+            AccountDomain,
+            DeviceName,
+            LocalIP,
+            AdditionalFields,
+            AlertVerdict_Custom
+    };
+    parser(
+        disabled = disabled
+    )
